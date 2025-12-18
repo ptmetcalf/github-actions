@@ -176,7 +176,9 @@ jobs:
         run: |
           set -euo pipefail
           # Check if what-if indicates no changes
-          if grep -qE "(No changes detected|Resource and property changes are indicated with this symbol)" whatif.txt && \
+          NO_CHANGES_PATTERN="(No changes detected|Resource and property changes"
+          NO_CHANGES_PATTERN="${NO_CHANGES_PATTERN} are indicated with this symbol)"
+          if grep -qE "${NO_CHANGES_PATTERN}" whatif.txt && \
              ! grep -qE "(\+|~|\-|x)" whatif.txt; then
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else

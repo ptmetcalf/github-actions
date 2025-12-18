@@ -336,25 +336,37 @@ jobs:
     steps:
       - name: Check test results
         run: |
-          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "| Test Suite | Status |" >> $GITHUB_STEP_SUMMARY
-          echo "|------------|--------|" >> $GITHUB_STEP_SUMMARY
-          echo "| YAML Validation | ${{ needs.yaml-validation.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| OpenTofu Workflows | ${{ needs.test-tofu-workflows.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Security Scanning | ${{ needs.test-security-scanning.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Bicep Workflows | ${{ needs.test-bicep-workflows.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Composite Actions | ${{ needs.test-composite-actions.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| Pre-commit | ${{ needs.test-precommit.result == 'success' && '✅ Passed' || '❌ Failed' }} |" >> $GITHUB_STEP_SUMMARY
+          # Helper function to format status
+          status() {
+            [ "$1" = "success" ] && echo "✅ Passed" || echo "❌ Failed"
+          }
+
+          # Generate summary
+          {
+            echo "## Test Results Summary"
+            echo ""
+            echo "| Test Suite | Status |"
+            echo "|------------|--------|"
+            echo "| YAML Validation | $(status "${{ needs.yaml-validation.result }}") |"
+            echo "| OpenTofu Workflows | $(status "${{ needs.test-tofu-workflows.result }}") |"
+            echo "| Security Scanning | $(status "${{ needs.test-security-scanning.result }}") |"
+            echo "| Bicep Workflows | $(status "${{ needs.test-bicep-workflows.result }}") |"
+            echo "| Composite Actions | $(status "${{ needs.test-composite-actions.result }}") |"
+            echo "| Pre-commit | $(status "${{ needs.test-precommit.result }}") |"
+          } >> $GITHUB_STEP_SUMMARY
 
           # Fail if any critical tests failed
           if [ "${{ needs.yaml-validation.result }}" != "success" ] || \
              [ "${{ needs.test-tofu-workflows.result }}" != "success" ] || \
              [ "${{ needs.test-composite-actions.result }}" != "success" ]; then
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "❌ **Critical tests failed. Please review and fix before merging.**" >> $GITHUB_STEP_SUMMARY
+            {
+              echo ""
+              echo "❌ **Critical tests failed. Please review and fix before merging.**"
+            } >> $GITHUB_STEP_SUMMARY
             exit 1
           fi
 
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "✅ **All critical tests passed!**" >> $GITHUB_STEP_SUMMARY
+          {
+            echo ""
+            echo "✅ **All critical tests passed!**"
+          } >> $GITHUB_STEP_SUMMARY
