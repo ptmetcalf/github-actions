@@ -1,0 +1,214 @@
+name: Bicep What-If
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (dev, prod, etc.)"
+        required: true
+        type: string
+      bicep_file:
+        description: "Path to main Bicep file (e.g., infra/main.bicep)"
+        required: true
+        type: string
+      parameters_file:
+        description: "Path to parameters file (e.g., env/dev.bicepparam)"
+        required: true
+        type: string
+      deployment_scope:
+        description: "Deployment scope: resourceGroup, subscription, managementGroup, or tenant"
+        required: false
+        type: string
+        default: "resourceGroup"
+      resource_group_name:
+        description: "Resource group name (required for resourceGroup scope)"
+        required: false
+        type: string
+      location:
+        description: "Azure region (required for subscription/managementGroup/tenant scope)"
+        required: false
+        type: string
+      subscription_id:
+        description: "Azure subscription ID (optional, uses default if not provided)"
+        required: false
+        type: string
+      management_group_id:
+        description: "Management group ID (required for managementGroup scope)"
+        required: false
+        type: string
+      bicep_version:
+        description: "Bicep version"
+        required: false
+        type: string
+        default: "latest"
+      pr_comment:
+        description: "Whether to comment what-if results on PR"
+        required: false
+        type: boolean
+        default: true
+      enable_security_scan:
+        description: "Enable security scanning (checkov, PSRule)"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      has_changes:
+        description: "Whether the what-if indicates changes"
+        value: ${{ jobs.whatif.outputs.has_changes }}
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+  security-events: write
+
+jobs:
+  whatif:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      has_changes: ${{ steps.detect_changes.outputs.has_changes }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure OIDC Login
+      # IMPORTANT: Configure federated credentials in Azure AD for your GitHub repo
+      # Replace these with your actual Azure tenant/client/subscription IDs
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscription_id || secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # NOTE: To reference the composite action from this repo, use the full path with version tag:
+      # uses: YOUR_ORG/github-actions/actions/setup-bicep@v1.0.0
+      # Or inline the bicep installation directly here.
+      - name: Setup Bicep
+        shell: bash
+        run: |
+          if [ "${{ inputs.bicep_version }}" = "latest" ]; then
+            az bicep install
+          else
+            az bicep install --version v${{ inputs.bicep_version }}
+          fi
+          az bicep version
+
+      - name: Build Bicep
+        run: az bicep build --file ${{ inputs.bicep_file }}
+
+      - name: Lint Bicep
+        run: az bicep lint --file ${{ inputs.bicep_file }}
+
+      - name: Run Checkov security scan
+        if: ${{ inputs.enable_security_scan }}
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: $(dirname ${{ inputs.bicep_file }})
+          framework: bicep
+          soft_fail: true
+          quiet: true
+
+      - name: Run PSRule for Azure
+        if: ${{ inputs.enable_security_scan }}
+        uses: microsoft/ps-rule@v2.9.0
+        with:
+          modules: 'PSRule.Rules.Azure'
+          inputPath: $(dirname ${{ inputs.bicep_file }})
+        continue-on-error: true
+
+      - name: Set Subscription (if provided)
+        if: ${{ inputs.subscription_id }}
+        run: az account set --subscription ${{ inputs.subscription_id }}
+
+      - name: What-If (Resource Group)
+        if: ${{ inputs.deployment_scope == 'resourceGroup' }}
+        id: whatif_rg
+        run: |
+          set -euo pipefail
+          az deployment group what-if \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --no-pretty-print \
+            | tee whatif.txt
+
+      - name: What-If (Subscription)
+        if: ${{ inputs.deployment_scope == 'subscription' }}
+        id: whatif_sub
+        run: |
+          set -euo pipefail
+          az deployment sub what-if \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --no-pretty-print \
+            | tee whatif.txt
+
+      - name: What-If (Management Group)
+        if: ${{ inputs.deployment_scope == 'managementGroup' }}
+        id: whatif_mg
+        run: |
+          set -euo pipefail
+          az deployment mg what-if \
+            --management-group-id ${{ inputs.management_group_id }} \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --no-pretty-print \
+            | tee whatif.txt
+
+      - name: What-If (Tenant)
+        if: ${{ inputs.deployment_scope == 'tenant' }}
+        id: whatif_tenant
+        run: |
+          set -euo pipefail
+          az deployment tenant what-if \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --no-pretty-print \
+            | tee whatif.txt
+
+      - name: Detect changes
+        id: detect_changes
+        run: |
+          set -euo pipefail
+          # Check if what-if indicates no changes
+          if grep -qE "(No changes detected|Resource and property changes are indicated with this symbol)" whatif.txt && \
+             ! grep -qE "(\+|~|\-|x)" whatif.txt; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Upload what-if results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bicep-whatif-${{ inputs.environment }}
+          path: whatif.txt
+
+      - name: Comment what-if results on PR
+        if: ${{ inputs.pr_comment && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const whatif = fs.readFileSync('whatif.txt', 'utf8');
+            const body = [
+              '## Bicep What-If - ${{ inputs.environment }}',
+              '',
+              '**Scope:** `${{ inputs.deployment_scope }}`',
+              '**File:** `${{ inputs.bicep_file }}`',
+              '',
+              '```',
+              whatif.length > 60000 ? whatif.slice(0, 60000) + "\n...truncated..." : whatif,
+              '```'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });

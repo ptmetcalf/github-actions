@@ -1,0 +1,20 @@
+name: "setup-tofu"
+description: "Install OpenTofu and common tooling"
+inputs:
+  tofu_version:
+    description: "OpenTofu version (e.g. 1.8.6). Use 'latest' for latest."
+    required: false
+    default: "latest"
+runs:
+  using: "composite"
+  steps:
+    - name: Setup OpenTofu
+      uses: opentofu/setup-opentofu@v1
+      with:
+        tofu_version: ${{ inputs.tofu_version }}
+
+    # Optional: add other tools commonly needed (comment in as you standardize)
+    # - name: Setup Node
+    #   uses: actions/setup-node@v4
+    #   with:
+    #     node-version: "20"

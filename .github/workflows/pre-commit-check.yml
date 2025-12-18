@@ -1,0 +1,93 @@
+name: Pre-commit Checks
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: "Python version for pre-commit"
+        required: false
+        type: string
+        default: "3.11"
+      skip_hooks:
+        description: "Comma-separated list of hook IDs to skip"
+        required: false
+        type: string
+        default: ""
+      extra_args:
+        description: "Extra arguments to pass to pre-commit"
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  pre-commit:
+    runs-on: ubuntu-latest
+    name: Pre-commit
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+
+      - name: Install pre-commit
+        run: pip install pre-commit
+
+      - name: Cache pre-commit hooks
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ hashFiles('.pre-commit-config.yaml') }}
+          restore-keys: |
+            pre-commit-
+
+      - name: Install system dependencies (OpenTofu)
+        run: |
+          # Install OpenTofu for terraform hooks
+          curl -fsSL https://get.opentofu.org/install-opentofu.sh | sudo sh
+
+          # Install terraform-docs
+          curl -sSLo ./terraform-docs.tar.gz https://github.com/terraform-docs/terraform-docs/releases/download/v0.17.0/terraform-docs-v0.17.0-linux-amd64.tar.gz
+          tar -xzf terraform-docs.tar.gz
+          sudo mv terraform-docs /usr/local/bin/
+          rm terraform-docs.tar.gz
+
+          # Install tfsec
+          curl -sSLo tfsec https://github.com/aquasecurity/tfsec/releases/download/v1.28.4/tfsec-linux-amd64
+          chmod +x tfsec
+          sudo mv tfsec /usr/local/bin/
+
+      - name: Install Azure CLI (for Bicep)
+        if: contains(github.event.repository.name, 'bicep')
+        uses: azure/CLI@v2
+        with:
+          azcliversion: latest
+          inlineScript: |
+            az bicep install
+            # Install PowerShell for PSRule
+            sudo apt-get update
+            sudo apt-get install -y powershell
+
+      - name: Run pre-commit
+        env:
+          SKIP: ${{ inputs.skip_hooks }}
+        run: |
+          if [ -n "${{ inputs.extra_args }}" ]; then
+            pre-commit run --all-files ${{ inputs.extra_args }}
+          else
+            pre-commit run --all-files
+          fi
+
+      - name: Upload pre-commit results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pre-commit-results
+          path: |
+            .pre-commit-cache
+            *.log

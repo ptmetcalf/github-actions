@@ -1,0 +1,107 @@
+name: OpenTofu Apply
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      stack_dir:
+        required: true
+        type: string
+      var_file:
+        required: true
+        type: string
+      tofu_version:
+        required: false
+        type: string
+        default: "latest"
+      plan_artifact_name:
+        required: false
+        type: string
+        default: "tfplan"
+      require_plan_artifact:
+        description: "If true, apply uses downloaded plan artifact; if false, re-plans then applies."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.stack_dir }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure OIDC authentication (required for Azure Storage state backend)
+      # This provides authentication for:
+      # - Azure Storage state backend access
+      # - azurerm provider (Azure resources)
+      # - azuread provider (Entra ID / Azure AD)
+      # - databricks provider (Azure Databricks)
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # NOTE: To reference the composite action from this repo, use the full path with version tag:
+      # uses: YOUR_ORG/github-actions/actions/setup-tofu@v1.0.0
+      # Or inline the opentofu/setup-opentofu step directly here.
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ inputs.tofu_version }}
+
+      # IMPORTANT: Additional authentication for other providers
+      # Providers that work with Azure login above (no additional auth needed):
+      #   - azurerm, azuread, databricks (Azure Databricks)
+      #
+      # Providers that need additional authentication:
+      #   - github: Requires GITHUB_TOKEN or GitHub PAT
+      #   - databricks (non-Azure): Requires Databricks token/credentials
+      #   - aws, google, etc.: Requires separate cloud authentication
+
+      # Example for GitHub provider (uncomment if using GitHub provider):
+      # - name: Setup GitHub Token
+      #   run: |
+      #     echo "GITHUB_TOKEN=${{ secrets.GH_PAT }}" >> $GITHUB_ENV
+      # Note: Can also use built-in ${{ github.token }} for limited operations
+
+      # Example for GCP (uncomment if deploying to GCP):
+      # - name: Authenticate to Google Cloud
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Init
+        run: tofu init -input=false
+
+      - name: Download plan artifact
+        if: ${{ inputs.require_plan_artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.plan_artifact_name }}
+          path: ${{ inputs.stack_dir }}
+
+      - name: Apply from plan artifact
+        if: ${{ inputs.require_plan_artifact }}
+        run: tofu apply -input=false -no-color tfplan
+
+      - name: Re-plan then apply (no plan artifact)
+        if: ${{ !inputs.require_plan_artifact }}
+        run: |
+          set -euo pipefail
+          tofu plan -input=false -no-color -var-file="${{ inputs.var_file }}" -out=tfplan
+          tofu apply -input=false -no-color tfplan

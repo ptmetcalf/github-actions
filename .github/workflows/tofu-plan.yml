@@ -1,0 +1,206 @@
+name: OpenTofu Plan
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (dev, prod, etc.)"
+        required: true
+        type: string
+      stack_dir:
+        description: "Directory containing tofu code (where main.tf lives)"
+        required: true
+        type: string
+      var_file:
+        description: "Path to tfvars file"
+        required: true
+        type: string
+      tofu_version:
+        description: "OpenTofu version"
+        required: false
+        type: string
+        default: "latest"
+      plan_artifact_name:
+        description: "Name for the uploaded plan artifact"
+        required: false
+        type: string
+        default: "tfplan"
+      pr_comment:
+        description: "Whether to comment plan summary on PR"
+        required: false
+        type: boolean
+        default: true
+      enable_security_scan:
+        description: "Enable security scanning (tfsec, checkov, trivy)"
+        required: false
+        type: boolean
+        default: true
+      enable_cost_estimate:
+        description: "Enable cost estimation with Infracost"
+        required: false
+        type: boolean
+        default: false
+    outputs:
+      has_changes:
+        description: "Whether the plan indicates changes"
+        value: ${{ jobs.plan.outputs.has_changes }}
+    secrets:
+      INFRACOST_API_KEY:
+        description: "Infracost API key (optional, required if enable_cost_estimate is true)"
+        required: false
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+  security-events: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.stack_dir }}
+    outputs:
+      has_changes: ${{ steps.detect_changes.outputs.has_changes }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure OIDC authentication (required for Azure Storage state backend)
+      # This provides authentication for:
+      # - Azure Storage state backend access
+      # - azurerm provider (Azure resources)
+      # - azuread provider (Entra ID / Azure AD)
+      # - databricks provider (Azure Databricks)
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # NOTE: To reference the composite action from this repo, use the full path with version tag:
+      # uses: YOUR_ORG/github-actions/actions/setup-tofu@v1.0.0
+      # Or inline the opentofu/setup-opentofu step directly here.
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ inputs.tofu_version }}
+
+      # IMPORTANT: Additional authentication for other providers
+      # Providers that work with Azure login above (no additional auth needed):
+      #   - azurerm, azuread, databricks (Azure Databricks)
+      #
+      # Providers that need additional authentication:
+      #   - github: Requires GITHUB_TOKEN or GitHub PAT
+      #   - databricks (non-Azure): Requires Databricks token/credentials
+      #   - aws, google, etc.: Requires separate cloud authentication
+
+      # Example for GitHub provider (uncomment if using GitHub provider):
+      # - name: Setup GitHub Token
+      #   run: |
+      #     echo "GITHUB_TOKEN=${{ secrets.GH_PAT }}" >> $GITHUB_ENV
+      # Note: Can also use built-in ${{ github.token }} for limited operations
+
+      # Example for GCP (uncomment if deploying to GCP):
+      # - name: Authenticate to Google Cloud
+      #   uses: google-github-actions/auth@v2
+      #   with:
+      #     workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+      #     service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Format check
+        run: tofu fmt -check -recursive
+
+      - name: Init
+        run: tofu init -input=false
+
+      - name: Validate
+        run: tofu validate
+
+      - name: Run tfsec security scan
+        if: ${{ inputs.enable_security_scan }}
+        uses: aquasecurity/tfsec-action@v1.0.3
+        with:
+          working_directory: ${{ inputs.stack_dir }}
+          soft_fail: true
+
+      - name: Run Checkov security scan
+        if: ${{ inputs.enable_security_scan }}
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ inputs.stack_dir }}
+          framework: terraform
+          soft_fail: true
+          download_external_modules: true
+          quiet: true
+
+      - name: Plan
+        id: plan
+        run: |
+          set -euo pipefail
+          tofu plan -input=false -no-color -var-file="${{ inputs.var_file }}" -out=tfplan | tee plan.txt
+
+      - name: Detect changes (best-effort)
+        id: detect_changes
+        run: |
+          set -euo pipefail
+          # Very simple heuristic. You can replace with a more robust parser later.
+          if grep -q "No changes" plan.txt; then
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Setup Infracost
+        if: ${{ inputs.enable_cost_estimate }}
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Generate Infracost JSON
+        if: ${{ inputs.enable_cost_estimate }}
+        run: |
+          tofu show -json tfplan > plan.json
+          infracost breakdown --path=plan.json \
+            --format=json \
+            --out-file=/tmp/infracost.json
+
+      - name: Post Infracost comment
+        if: ${{ inputs.enable_cost_estimate && github.event_name == 'pull_request' }}
+        run: |
+          infracost comment github --path=/tmp/infracost.json \
+            --repo=$GITHUB_REPOSITORY \
+            --github-token=${{ github.token }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update
+
+      - name: Upload plan artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.plan_artifact_name }}
+          path: ${{ inputs.stack_dir }}/tfplan
+
+      - name: Comment plan summary on PR
+        if: ${{ inputs.pr_comment && github.event_name == 'pull_request' }}
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ inputs.stack_dir }}/plan.txt', 'utf8');
+            const body = [
+              '## OpenTofu plan',
+              '',
+              '```',
+              plan.length > 60000 ? plan.slice(0, 60000) + "\n...truncated..." : plan,
+              '```'
+            ].join('\n');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body
+            });

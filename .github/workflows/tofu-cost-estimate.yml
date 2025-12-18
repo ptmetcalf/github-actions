@@ -1,0 +1,130 @@
+name: OpenTofu Cost Estimate
+
+on:
+  workflow_call:
+    inputs:
+      stack_dir:
+        description: "Directory containing tofu code (where main.tf lives)"
+        required: true
+        type: string
+      var_file:
+        description: "Path to tfvars file"
+        required: true
+        type: string
+      tofu_version:
+        description: "OpenTofu version"
+        required: false
+        type: string
+        default: "latest"
+      currency:
+        description: "Currency for cost estimates (USD, EUR, GBP, etc.)"
+        required: false
+        type: string
+        default: "USD"
+      pr_comment:
+        description: "Whether to comment cost estimate on PR"
+        required: false
+        type: boolean
+        default: true
+      show_skipped:
+        description: "Show skipped resources in output"
+        required: false
+        type: boolean
+        default: false
+      sync_usage_file:
+        description: "Sync usage file from Infracost Cloud"
+        required: false
+        type: boolean
+        default: false
+    secrets:
+      INFRACOST_API_KEY:
+        description: "Infracost API key (get free key at https://infracost.io)"
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: write
+  id-token: write
+
+jobs:
+  cost-estimate:
+    runs-on: ubuntu-latest
+    name: Cost Estimate
+    defaults:
+      run:
+        shell: bash
+        working-directory: ${{ inputs.stack_dir }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup OpenTofu
+        uses: opentofu/setup-opentofu@v1
+        with:
+          tofu_version: ${{ inputs.tofu_version }}
+
+      # IMPORTANT: Insert your cloud auth here (OIDC recommended).
+      # Infracost needs provider credentials to fetch pricing data.
+
+      - name: Setup Infracost
+        uses: infracost/actions/setup@v3
+        with:
+          api-key: ${{ secrets.INFRACOST_API_KEY }}
+
+      - name: Checkout base branch
+        if: github.event_name == 'pull_request'
+        uses: actions/checkout@v4
+        with:
+          ref: '${{ github.event.pull_request.base.ref }}'
+          path: base
+
+      - name: Generate Infracost cost estimate baseline
+        if: github.event_name == 'pull_request'
+        run: |
+          cd ${{ github.workspace }}/base/${{ inputs.stack_dir }}
+          tofu init -input=false
+          tofu plan -input=false -var-file="${{ github.workspace }}/base/${{ inputs.var_file }}" -out=tfplan
+          tofu show -json tfplan > plan.json
+
+          infracost breakdown --path=plan.json \
+            --format=json \
+            --out-file=/tmp/infracost-base.json
+
+      - name: Generate Infracost diff
+        run: |
+          tofu init -input=false
+          tofu plan -input=false -var-file="${{ inputs.var_file }}" -out=tfplan
+          tofu show -json tfplan > plan.json
+
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            infracost diff --path=plan.json \
+              --format=json \
+              --compare-to=/tmp/infracost-base.json \
+              --out-file=/tmp/infracost.json
+          else
+            infracost breakdown --path=plan.json \
+              --format=json \
+              --out-file=/tmp/infracost.json
+          fi
+
+      - name: Post Infracost comment
+        if: ${{ inputs.pr_comment && github.event_name == 'pull_request' }}
+        run: |
+          infracost comment github --path=/tmp/infracost.json \
+            --repo=$GITHUB_REPOSITORY \
+            --github-token=${{ github.token }} \
+            --pull-request=${{ github.event.pull_request.number }} \
+            --behavior=update \
+            --show-skipped=${{ inputs.show_skipped }}
+
+      - name: Generate cost summary
+        run: |
+          echo "## Cost Estimate Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          infracost output --path=/tmp/infracost.json --format=table >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload Infracost JSON
+        uses: actions/upload-artifact@v4
+        with:
+          name: infracost-estimate
+          path: /tmp/infracost.json

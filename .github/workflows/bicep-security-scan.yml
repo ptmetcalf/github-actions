@@ -1,0 +1,156 @@
+name: Bicep Security Scan
+
+on:
+  workflow_call:
+    inputs:
+      bicep_file:
+        description: "Path to main Bicep file (e.g., infra/main.bicep)"
+        required: true
+        type: string
+      bicep_dir:
+        description: "Directory containing Bicep files (defaults to directory of bicep_file)"
+        required: false
+        type: string
+      fail_on_severity:
+        description: "Fail build on severity level (CRITICAL, HIGH, MEDIUM, LOW)"
+        required: false
+        type: string
+        default: "HIGH"
+      enable_checkov:
+        description: "Enable Checkov scanning"
+        required: false
+        type: boolean
+        default: true
+      enable_psrule:
+        description: "Enable PSRule for Azure scanning"
+        required: false
+        type: boolean
+        default: true
+      enable_trivy:
+        description: "Enable Trivy scanning"
+        required: false
+        type: boolean
+        default: true
+      upload_sarif:
+        description: "Upload results to GitHub Security tab (requires Advanced Security)"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  security-events: write
+  pull-requests: write
+
+jobs:
+  checkov:
+    if: ${{ inputs.enable_checkov }}
+    runs-on: ubuntu-latest
+    name: Checkov
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set scan directory
+        id: set_dir
+        run: |
+          if [ -n "${{ inputs.bicep_dir }}" ]; then
+            echo "scan_dir=${{ inputs.bicep_dir }}" >> $GITHUB_OUTPUT
+          else
+            echo "scan_dir=$(dirname ${{ inputs.bicep_file }})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Checkov
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: ${{ steps.set_dir.outputs.scan_dir }}
+          framework: bicep
+          output_format: cli,sarif
+          output_file_path: console,results.sarif
+          soft_fail: true
+
+      - name: Upload Checkov SARIF
+        if: ${{ inputs.upload_sarif && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: results.sarif
+          category: checkov-bicep
+
+  psrule:
+    if: ${{ inputs.enable_psrule }}
+    runs-on: ubuntu-latest
+    name: PSRule for Azure
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set scan directory
+        id: set_dir
+        run: |
+          if [ -n "${{ inputs.bicep_dir }}" ]; then
+            echo "scan_dir=${{ inputs.bicep_dir }}" >> $GITHUB_OUTPUT
+          else
+            echo "scan_dir=$(dirname ${{ inputs.bicep_file }})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run PSRule for Azure
+        uses: microsoft/ps-rule@v2.9.0
+        with:
+          modules: 'PSRule.Rules.Azure'
+          inputPath: ${{ steps.set_dir.outputs.scan_dir }}
+          outputFormat: Sarif
+          outputPath: reports/ps-rule-results.sarif
+        continue-on-error: true
+
+      - name: Upload PSRule SARIF
+        if: ${{ inputs.upload_sarif && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: reports/ps-rule-results.sarif
+          category: psrule-azure
+
+  trivy:
+    if: ${{ inputs.enable_trivy }}
+    runs-on: ubuntu-latest
+    name: Trivy
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set scan directory
+        id: set_dir
+        run: |
+          if [ -n "${{ inputs.bicep_dir }}" ]; then
+            echo "scan_dir=${{ inputs.bicep_dir }}" >> $GITHUB_OUTPUT
+          else
+            echo "scan_dir=$(dirname ${{ inputs.bicep_file }})" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Run Trivy IaC scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'config'
+          scan-ref: ${{ steps.set_dir.outputs.scan_dir }}
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: ${{ inputs.fail_on_severity }}
+          exit-code: '0'
+
+      - name: Upload Trivy SARIF
+        if: ${{ inputs.upload_sarif && always() }}
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+          category: trivy-bicep
+
+  summary:
+    runs-on: ubuntu-latest
+    needs: [checkov, psrule, trivy]
+    if: always()
+    steps:
+      - name: Security Scan Summary
+        run: |
+          echo "## Security Scan Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Checkov | ${{ needs.checkov.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| PSRule  | ${{ needs.psrule.result }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Trivy   | ${{ needs.trivy.result }} |" >> $GITHUB_STEP_SUMMARY

@@ -1,0 +1,32 @@
+name: "setup-bicep"
+description: "Install Bicep CLI and Azure CLI"
+inputs:
+  bicep_version:
+    description: "Bicep version (e.g. 0.24.24). Use 'latest' for latest."
+    required: false
+    default: "latest"
+runs:
+  using: "composite"
+  steps:
+    - name: Setup Azure CLI
+      uses: azure/CLI@v2
+      with:
+        azcliversion: latest
+        inlineScript: |
+          echo "Azure CLI installed"
+
+    - name: Install Bicep CLI
+      shell: bash
+      run: |
+        if [ "${{ inputs.bicep_version }}" = "latest" ]; then
+          az bicep install
+        else
+          az bicep install --version v${{ inputs.bicep_version }}
+        fi
+        az bicep version
+
+    # Optional: add other tools commonly needed
+    # - name: Setup Node
+    #   uses: actions/setup-node@v4
+    #   with:
+    #     node-version: "20"

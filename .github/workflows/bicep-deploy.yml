@@ -1,0 +1,179 @@
+name: Bicep Deploy
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "Environment name (dev, prod, etc.)"
+        required: true
+        type: string
+      bicep_file:
+        description: "Path to main Bicep file (e.g., infra/main.bicep)"
+        required: true
+        type: string
+      parameters_file:
+        description: "Path to parameters file (e.g., env/dev.bicepparam)"
+        required: true
+        type: string
+      deployment_scope:
+        description: "Deployment scope: resourceGroup, subscription, managementGroup, or tenant"
+        required: false
+        type: string
+        default: "resourceGroup"
+      resource_group_name:
+        description: "Resource group name (required for resourceGroup scope)"
+        required: false
+        type: string
+      location:
+        description: "Azure region (required for subscription/managementGroup/tenant scope)"
+        required: false
+        type: string
+      subscription_id:
+        description: "Azure subscription ID (optional, uses default if not provided)"
+        required: false
+        type: string
+      management_group_id:
+        description: "Management group ID (required for managementGroup scope)"
+        required: false
+        type: string
+      bicep_version:
+        description: "Bicep version"
+        required: false
+        type: string
+        default: "latest"
+      deployment_name:
+        description: "Name for the deployment (defaults to generated name)"
+        required: false
+        type: string
+      confirm_what_if:
+        description: "Run what-if before deploying as a safety check"
+        required: false
+        type: boolean
+        default: true
+    outputs:
+      deployment_name:
+        description: "Name of the deployment"
+        value: ${{ jobs.deploy.outputs.deployment_name }}
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    outputs:
+      deployment_name: ${{ steps.set_deployment_name.outputs.deployment_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Azure OIDC Login
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ inputs.subscription_id || secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # NOTE: To reference the composite action from this repo, use the full path with version tag:
+      # uses: YOUR_ORG/github-actions/actions/setup-bicep@v1.0.0
+      # Or inline the bicep installation directly here.
+      - name: Setup Bicep
+        shell: bash
+        run: |
+          if [ "${{ inputs.bicep_version }}" = "latest" ]; then
+            az bicep install
+          else
+            az bicep install --version v${{ inputs.bicep_version }}
+          fi
+          az bicep version
+
+      - name: Build Bicep
+        run: az bicep build --file ${{ inputs.bicep_file }}
+
+      - name: Set Subscription (if provided)
+        if: ${{ inputs.subscription_id }}
+        run: az account set --subscription ${{ inputs.subscription_id }}
+
+      - name: Set Deployment Name
+        id: set_deployment_name
+        run: |
+          if [ -n "${{ inputs.deployment_name }}" ]; then
+            echo "deployment_name=${{ inputs.deployment_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "deployment_name=deploy-$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Pre-deployment What-If (Resource Group)
+        if: ${{ inputs.confirm_what_if && inputs.deployment_scope == 'resourceGroup' }}
+        run: |
+          echo "Running what-if before deployment as a safety check..."
+          az deployment group what-if \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }}
+
+      - name: Pre-deployment What-If (Subscription)
+        if: ${{ inputs.confirm_what_if && inputs.deployment_scope == 'subscription' }}
+        run: |
+          echo "Running what-if before deployment as a safety check..."
+          az deployment sub what-if \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }}
+
+      - name: Deploy (Resource Group)
+        if: ${{ inputs.deployment_scope == 'resourceGroup' }}
+        run: |
+          set -euo pipefail
+          az deployment group create \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --name ${{ steps.set_deployment_name.outputs.deployment_name }} \
+            --verbose
+
+      - name: Deploy (Subscription)
+        if: ${{ inputs.deployment_scope == 'subscription' }}
+        run: |
+          set -euo pipefail
+          az deployment sub create \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --name ${{ steps.set_deployment_name.outputs.deployment_name }} \
+            --verbose
+
+      - name: Deploy (Management Group)
+        if: ${{ inputs.deployment_scope == 'managementGroup' }}
+        run: |
+          set -euo pipefail
+          az deployment mg create \
+            --management-group-id ${{ inputs.management_group_id }} \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --name ${{ steps.set_deployment_name.outputs.deployment_name }} \
+            --verbose
+
+      - name: Deploy (Tenant)
+        if: ${{ inputs.deployment_scope == 'tenant' }}
+        run: |
+          set -euo pipefail
+          az deployment tenant create \
+            --location ${{ inputs.location }} \
+            --template-file ${{ inputs.bicep_file }} \
+            --parameters ${{ inputs.parameters_file }} \
+            --name ${{ steps.set_deployment_name.outputs.deployment_name }} \
+            --verbose
+
+      - name: Show Deployment Outputs
+        if: ${{ inputs.deployment_scope == 'resourceGroup' }}
+        run: |
+          echo "Deployment completed: ${{ steps.set_deployment_name.outputs.deployment_name }}"
+          az deployment group show \
+            --resource-group ${{ inputs.resource_group_name }} \
+            --name ${{ steps.set_deployment_name.outputs.deployment_name }} \
+            --query properties.outputs
